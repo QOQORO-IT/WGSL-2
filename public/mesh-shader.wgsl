@@ -38,8 +38,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
   let sunDir = normalize(-uniforms.sunDir);
   let normal = normalize(input.normal);
   let NdotL = max(dot(normal, sunDir), 0.0);
-  let ambient = 0.35;
-  let diffuse = 0.65 * NdotL;
+  let ambient = 0.42;
+  let diffuse = 0.70 * NdotL;
   let lighting = ambient + diffuse;
 
   // Fill light
@@ -54,7 +54,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
   let fogDist = length(input.worldPos - vec3<f32>(16.0, 8.0, 16.0));
   let fogAmount = smoothstep(40.0, 90.0, fogDist);
   let fogColor = vec3<f32>(0.4, 0.6, 0.9);
-  color = mix(color, fogColor, fogAmount * 0.6);
+  color = mix(color, fogColor, fogAmount * 0.42);
 
   return vec4<f32>(color, alpha);
 }

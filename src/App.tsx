@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { VoxelMeshRenderer, setupInput, updateCamera, camera } from "./voxel-mesh";
+import { VoxelMeshRenderer, setupInput, updateCamera, camera, getToolStatus } from "./voxel-mesh";
 
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -14,6 +14,7 @@ function App() {
     rendererRef.current = renderer;
 
     let lastTime = performance.now();
+    let fpsLastTime = lastTime;
     let frameCount = 0;
     let fps = 0;
     const fpsElem = document.getElementById("fps");
@@ -30,14 +31,15 @@ function App() {
           const deltaTime = Math.min((now - lastTime) / 1000, 0.1);
           lastTime = now;
 
-          updateCamera(deltaTime);
+          updateCamera(deltaTime, renderer);
           renderer.render();
 
           frameCount++;
-          if (now % 1000 < 20 && fpsElem) {
-            fps = Math.round(frameCount / (deltaTime || 0.016));
+          if (now - fpsLastTime >= 500 && fpsElem) {
+            fps = Math.round((frameCount * 1000) / (now - fpsLastTime));
             frameCount = 0;
-            fpsElem.textContent = `FPS: ${fps} | Quads: ~${(renderer.indexCount / 6).toLocaleString()} | Position: ${camera.position.map((v: number) => v.toFixed(1)).join(", ")}`;
+            fpsLastTime = now;
+            fpsElem.textContent = `FPS: ${fps} | Quads: ~${(renderer.indexCount / 6).toLocaleString()} | Position: ${camera.position.map((v: number) => v.toFixed(1)).join(", ")} | ${getToolStatus()}`;
           }
 
           animRef.current = requestAnimationFrame(frame);
@@ -83,7 +85,7 @@ function App() {
       <div className="absolute top-4 left-4 text-white font-mono text-sm bg-black/60 px-3 py-2 rounded select-none pointer-events-none">
         <div id="fps">Initializing mesh renderer...</div>
         <div className="text-xs text-gray-400 mt-1">
-          WASD = Move | Space = Up | Shift = Down | Mouse = Look | Click = Lock Cursor | Esc = Unlock
+          WASD = Walk | Space = Jump | F = Walk/Fly | 1 Build | 2 Erase | 3 Wall | [ ] Wall Height | Click = Apply
         </div>
       </div>
       <div

@@ -25,6 +25,14 @@ export let camera: CameraState = {
 
 let keys: Record<string, boolean> = {};
 let mouseLocked = false;
+let activeRenderer: VoxelMeshRenderer | null = null;
+let toolMode: ToolMode = "build";
+let wallAnchor: GridPos | null = null;
+let wallHeight = 4;
+let justJumped = false;
+let playerVelocityY = 0;
+let playerGrounded = false;
+let walkMode = true;
 
 const VOXEL_COLORS: Record<number, [number, number, number, number]> = {
   1:  [0.35, 0.65, 0.25, 1.0],
@@ -53,25 +61,157 @@ const NEIGHBOR_OFFSETS = [[-1,0,0],[0,-1,0],[0,0,-1],[1,0,0],[0,1,0],[0,0,1]];
 const QUAD_LOCAL = [[0,0,0],[1,0,0],[0,1,0],[1,1,0]];
 const QUAD_INDICES = [0,1,2,2,1,3];
 
-// For each top-face corner (vi 0-3), which 3 neighbours must ALL be empty for the corner to slope down?
-// Corner vi=0 → world offset (0,0): neighbours at (-1,0), (0,-1), (-1,-1) in XZ
-// Corner vi=1 → world offset (1,0): neighbours at (+1,0), (0,-1), (+1,-1)
-// Corner vi=2 → world offset (0,1): neighbours at (-1,0), (0,+1), (-1,+1)
-// Corner vi=3 → world offset (1,1): neighbours at (+1,0), (0,+1), (+1,+1)
-const TOP_CORNER_NEIGHBORS: [number, number][][] = [
-  [[-1,0],[0,-1],[-1,-1]],
-  [[ 1,0],[0,-1],[ 1,-1]],
-  [[-1,0],[0, 1],[-1, 1]],
-  [[ 1,0],[0, 1],[ 1, 1]],
-];
+const SMOOTH_TERRAIN_TYPES = new Set([1, 2, 8]);
+const PREVIEW_BUILD_COLOR: Vec4 = [0.2, 0.8, 1.0, 0.35];
+const PREVIEW_ERASE_COLOR: Vec4 = [1.0, 0.25, 0.2, 0.35];
+const BUILD_BLOCK_TYPE = 9;
+const PLAYER_RADIUS = 0.28;
+const PLAYER_HEIGHT = 1.65;
+const PLAYER_EYE = 1.45;
+const AUTO_STEP_HEIGHT = VOXEL_SCALE * 1.25;
 
-// For each side face index, which top-face corner indices correspond to vi=2 and vi=3 (the top edge)?
-const SIDE_TOP_CORNERS: Record<number,[number,number]> = {
-  0: [0,2], // -X face
-  3: [1,3], // +X face
-  2: [0,1], // -Z face
-  5: [2,3], // +Z face
-};
+type ToolMode = "build" | "erase" | "wall";
+type GridPos = [number, number, number];
+
+type Vec3 = [number, number, number];
+type Vec4 = [number, number, number, number];
+
+function isSmoothTerrain(type: number) {
+  return SMOOTH_TERRAIN_TYPES.has(type);
+}
+
+function isSolidVoxel(type: number) {
+  return type !== 0 && type !== 4;
+}
+
+function pushVertex(
+  vertices: number[],
+  position: Vec3,
+  normal: Vec3,
+  color: Vec4,
+  uv: [number, number] = [0, 0],
+) {
+  vertices.push(
+    position[0] * VOXEL_SCALE, position[1] * VOXEL_SCALE, position[2] * VOXEL_SCALE,
+    normal[0], normal[1], normal[2],
+    color[0], color[1], color[2], color[3],
+    uv[0], uv[1]
+  );
+}
+
+function pushQuad(
+  vertices: number[],
+  indices: number[],
+  vertexCount: number,
+  points: [Vec3, Vec3, Vec3, Vec3],
+  normal: Vec3,
+  color: Vec4,
+) {
+  pushVertex(vertices, points[0], normal, color, [0, 0]);
+  pushVertex(vertices, points[1], normal, color, [1, 0]);
+  pushVertex(vertices, points[2], normal, color, [0, 1]);
+  pushVertex(vertices, points[3], normal, color, [1, 1]);
+  for (let ii = 0; ii < 6; ii++) indices.push(vertexCount + QUAD_INDICES[ii]);
+  return vertexCount + 4;
+}
+
+function normalizeVec3(v: Vec3): Vec3 {
+  const len = Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) || 1;
+  return [v[0] / len, v[1] / len, v[2] / len];
+}
+
+function quadNormal(points: [Vec3, Vec3, Vec3, Vec3]): Vec3 {
+  const ax = points[1][0] - points[0][0];
+  const ay = points[1][1] - points[0][1];
+  const az = points[1][2] - points[0][2];
+  const bx = points[2][0] - points[0][0];
+  const by = points[2][1] - points[0][1];
+  const bz = points[2][2] - points[0][2];
+  return normalizeVec3([
+    ay * bz - az * by,
+    az * bx - ax * bz,
+    ax * by - ay * bx,
+  ]);
+}
+
+function terrainNoise(x: number, z: number) {
+  const n = Math.sin(x * 12.9898 + z * 78.233) * 43758.5453;
+  return n - Math.floor(n);
+}
+
+function terrainColor(type: number, x: number, z: number, height: number, normal: Vec3): Vec4 {
+  const base = getVoxelColor(type);
+  const noise = terrainNoise(x, z);
+  const fine = terrainNoise(x * 3.7 + 11, z * 3.7 - 5);
+  const contour = Math.abs((height % 1) - 0.5) > 0.42 ? -0.09 : 0;
+  const slopeShade = Math.max(0.62, Math.min(1.12, normal[1] * 0.95 + 0.18));
+  const heightTint = Math.max(-0.10, Math.min(0.18, (height - 34) * 0.012));
+  const speckle = (noise - 0.5) * 0.16 + (fine > 0.82 ? 0.10 : 0);
+  const stripe = ((Math.floor(x * 0.5) + Math.floor(z * 0.5)) & 1) === 0 ? 0.035 : -0.015;
+  const v = slopeShade + heightTint + speckle + contour + stripe;
+
+  if (type === 8) {
+    return [
+      Math.max(0, Math.min(1, base[0] + v * 0.55)),
+      Math.max(0, Math.min(1, base[1] + v * 0.45)),
+      Math.max(0, Math.min(1, base[2] + v * 0.25)),
+      base[3],
+    ];
+  }
+
+  return [
+    Math.max(0, Math.min(1, base[0] + v * 0.28)),
+    Math.max(0, Math.min(1, base[1] + v * 0.38)),
+    Math.max(0, Math.min(1, base[2] + v * 0.18)),
+    base[3],
+  ];
+}
+
+function pushTerrainTop(
+  vertices: number[],
+  indices: number[],
+  vertexCount: number,
+  points: [Vec3, Vec3, Vec3, Vec3],
+  type: number,
+) {
+  const normal = quadNormal(points);
+  for (let vi = 0; vi < 4; vi++) {
+    const p = points[vi];
+    pushVertex(vertices, p, normal, terrainColor(type, p[0], p[2], p[1], normal), [QUAD_LOCAL[vi][0], QUAD_LOCAL[vi][1]]);
+  }
+  for (let ii = 0; ii < 6; ii++) indices.push(vertexCount + QUAD_INDICES[ii]);
+  return vertexCount + 4;
+}
+
+function appendBlockMesh(vertices: number[], indices: number[], vertexCount: number, x: number, y: number, z: number, color: Vec4, inflate = 0) {
+  for (let face = 0; face < 6; face++) {
+    const normal = FACE_NORMALS[face] as Vec3;
+    const uAxis = FACE_U_AXES[face];
+    const vAxis = FACE_V_AXES[face];
+    for (let vi = 0; vi < 4; vi++) {
+      const lp = QUAD_LOCAL[vi];
+      let wx = x - inflate, wy = y - inflate, wz = z - inflate;
+      if (face >= 3) {
+        wx += normal[0] * (1 + inflate * 2);
+        wy += normal[1] * (1 + inflate * 2);
+        wz += normal[2] * (1 + inflate * 2);
+      }
+      wx += lp[0] * uAxis[0] + lp[1] * vAxis[0];
+      wy += lp[0] * uAxis[1] + lp[1] * vAxis[1];
+      wz += lp[0] * uAxis[2] + lp[1] * vAxis[2];
+      if (uAxis[0] !== 0) wx += lp[0] * inflate * 2;
+      if (uAxis[1] !== 0) wy += lp[0] * inflate * 2;
+      if (uAxis[2] !== 0) wz += lp[0] * inflate * 2;
+      if (vAxis[0] !== 0) wx += lp[1] * inflate * 2;
+      if (vAxis[1] !== 0) wy += lp[1] * inflate * 2;
+      if (vAxis[2] !== 0) wz += lp[1] * inflate * 2;
+      pushVertex(vertices, [wx, wy, wz], normal, color, [lp[0], lp[1]]);
+    }
+    for (let ii = 0; ii < 6; ii++) indices.push(vertexCount + QUAD_INDICES[ii]);
+    vertexCount += 4;
+  }
+  return vertexCount;
+}
 
 function generateVoxelWorld(sx: number, sy: number, sz: number): Uint8Array {
   const data = new Uint8Array(sx * sy * sz);
@@ -102,22 +242,102 @@ function generateVoxelWorld(sx: number, sy: number, sz: number): Uint8Array {
   return data;
 }
 
-function computeCornerYOffsets(data: Uint8Array, sx: number, sy: number, sz: number, x: number, y: number, z: number): number[] {
-  // Only called when the top face (y+1) is exposed (air).
-  // For each of the 4 top-face corners, check the 3 XZ neighbours at the same Y level.
-  // If ALL three are air (solid block is one step lower), slope the corner down by 1.
-  const offsets = [0, 0, 0, 0];
-  for (let ci = 0; ci < 4; ci++) {
-    let allLower = true;
-    for (const [dx, dz] of TOP_CORNER_NEIGHBORS[ci]) {
-      const nx = x + dx, nz = z + dz;
-      if (nx < 0 || nx >= sx || nz < 0 || nz >= sz) { allLower = false; break; }
-      const nIdx = nx * sy * sz + y * sz + nz;
-      if (data[nIdx] !== 0) { allLower = false; break; }
+function buildTerrainColumns(data: Uint8Array, sx: number, sy: number, sz: number) {
+  const topY = new Float32Array(sx * sz);
+  const blockY = new Int16Array(sx * sz);
+  const type = new Uint8Array(sx * sz);
+  const visible = new Uint8Array(sx * sz);
+
+  for (let x = 0; x < sx; x++) {
+    for (let z = 0; z < sz; z++) {
+      const ci = x * sz + z;
+      blockY[ci] = -1;
+      for (let y = sy - 2; y >= 1; y--) {
+        const idx = x * sy * sz + y * sz + z;
+        const voxelType = data[idx];
+        if (!isSmoothTerrain(voxelType)) continue;
+
+        type[ci] = voxelType;
+        blockY[ci] = y;
+        topY[ci] = y + 1;
+        const above = data[x * sy * sz + (y + 1) * sz + z];
+        visible[ci] = above === 0 || above === 4 ? 1 : 0;
+        break;
+      }
     }
-    if (allLower) offsets[ci] = -1;
   }
-  return offsets;
+
+  return { topY, blockY, type, visible };
+}
+
+function terrainColumnIndex(sx: number, sz: number, x: number, z: number) {
+  if (x < 0 || x >= sx || z < 0 || z >= sz) return -1;
+  return x * sz + z;
+}
+
+function terrainCornerY(columns: ReturnType<typeof buildTerrainColumns>, sx: number, sz: number, gx: number, gz: number, fallback: number) {
+  const coords = [[gx - 1, gz - 1], [gx, gz - 1], [gx - 1, gz], [gx, gz]];
+  let sum = 0;
+  let count = 0;
+  for (const [x, z] of coords) {
+    const ci = terrainColumnIndex(sx, sz, x, z);
+    if (ci < 0 || columns.visible[ci] === 0 || columns.topY[ci] <= 0) continue;
+    sum += columns.topY[ci];
+    count++;
+  }
+  return count > 0 ? sum / count : fallback;
+}
+
+function terrainCellHeights(columns: ReturnType<typeof buildTerrainColumns>, sx: number, sz: number, x: number, z: number) {
+  const ci = terrainColumnIndex(sx, sz, x, z);
+  const fallback = columns.topY[ci];
+  return [
+    terrainCornerY(columns, sx, sz, x, z, fallback),
+    terrainCornerY(columns, sx, sz, x + 1, z, fallback),
+    terrainCornerY(columns, sx, sz, x, z + 1, fallback),
+    terrainCornerY(columns, sx, sz, x + 1, z + 1, fallback),
+  ];
+}
+
+function appendTerrainSurfaceMesh(data: Uint8Array, sx: number, sy: number, sz: number, vertices: number[], indices: number[], vertexCount: number) {
+  const columns = buildTerrainColumns(data, sx, sy, sz);
+  const minX = 1, maxX = sx - 2, minZ = 1, maxZ = sz - 2;
+
+  for (let x = minX; x <= maxX; x++) {
+    for (let z = minZ; z <= maxZ; z++) {
+      const ci = terrainColumnIndex(sx, sz, x, z);
+      if (columns.visible[ci] === 0 || columns.topY[ci] <= 0) continue;
+
+      const color = getVoxelColor(columns.type[ci]);
+      const h = terrainCellHeights(columns, sx, sz, x, z);
+
+      const topPoints: [Vec3, Vec3, Vec3, Vec3] = [
+        [x, h[0], z],
+        [x + 1, h[1], z],
+        [x, h[2], z + 1],
+        [x + 1, h[3], z + 1],
+      ];
+      vertexCount = pushTerrainTop(vertices, indices, vertexCount, topPoints, columns.type[ci]);
+
+      const edges = [
+        { normal: [-1, 0, 0] as Vec3, top: [[x, h[0], z], [x, h[2], z + 1]] as [Vec3, Vec3] },
+        { normal: [1, 0, 0] as Vec3, top: [[x + 1, h[1], z], [x + 1, h[3], z + 1]] as [Vec3, Vec3] },
+        { normal: [0, 0, -1] as Vec3, top: [[x, h[0], z], [x + 1, h[1], z]] as [Vec3, Vec3] },
+        { normal: [0, 0, 1] as Vec3, top: [[x, h[2], z + 1], [x + 1, h[3], z + 1]] as [Vec3, Vec3] },
+      ];
+
+      for (const edge of edges) {
+        vertexCount = pushQuad(vertices, indices, vertexCount, [
+          edge.top[0],
+          edge.top[1],
+          [edge.top[0][0], columns.blockY[ci], edge.top[0][2]],
+          [edge.top[1][0], columns.blockY[ci], edge.top[1][2]],
+        ], edge.normal, color);
+      }
+    }
+  }
+
+  return vertexCount;
 }
 
 function generateVisibleBlockFaces(data: Uint8Array, sx: number, sy: number, sz: number) {
@@ -134,13 +354,12 @@ function generateVisibleBlockFaces(data: Uint8Array, sx: number, sy: number, sz:
         if (voxelType === 0) continue;
         const color = getVoxelColor(voxelType);
 
-        // Precompute top-face slope offsets once per block
         const topExposed = data[x * sy * sz + (y + 1) * sz + z] === 0;
-        const cornerYOffsets = topExposed
-          ? computeCornerYOffsets(data, sx, sy, sz, x, y, z)
-          : [0, 0, 0, 0];
+        const smoothTerrain = isSmoothTerrain(voxelType);
 
         for (let face = 0; face < 6; face++) {
+          if (topExposed && smoothTerrain && face !== 1) continue;
+
           const [nx, ny, nz] = NEIGHBOR_OFFSETS[face];
           const nxIdx = (x + nx) * sy * sz + (y + ny) * sz + (z + nz);
           const neighborType = data[nxIdx];
@@ -152,22 +371,6 @@ function generateVisibleBlockFaces(data: Uint8Array, sx: number, sy: number, sz:
             const uAxis = FACE_U_AXES[face];
             const vAxis = FACE_V_AXES[face];
 
-            // Determine per-vertex Y offsets for slopes
-            const faceOffsets = [0, 0, 0, 0];
-            if (face === 4) {
-              // Top face: apply all 4 corner offsets
-              for (let i = 0; i < 4; i++) faceOffsets[i] = cornerYOffsets[i];
-            } else if (face in SIDE_TOP_CORNERS) {
-              // Side face: top verts (vi=2,3) inherit the matching top-face corners
-              const [c2, c3] = SIDE_TOP_CORNERS[face];
-              const off2 = cornerYOffsets[c2];
-              const off3 = cornerYOffsets[c3];
-              // If BOTH top corners collapsed to y, this side face has zero height – skip it
-              if (off2 === -1 && off3 === -1) continue;
-              faceOffsets[2] = off2;
-              faceOffsets[3] = off3;
-            }
-
             for (let vi = 0; vi < 4; vi++) {
               const lp = QUAD_LOCAL[vi];
               let wx = x, wy = y, wz = z;
@@ -175,32 +378,17 @@ function generateVisibleBlockFaces(data: Uint8Array, sx: number, sy: number, sz:
               wx += lp[0] * uAxis[0] + lp[1] * vAxis[0];
               wy += lp[0] * uAxis[1] + lp[1] * vAxis[1];
               wz += lp[0] * uAxis[2] + lp[1] * vAxis[2];
-              wy += faceOffsets[vi]; // apply slope
-              vertices.push(
-                wx * VOXEL_SCALE, wy * VOXEL_SCALE, wz * VOXEL_SCALE,
-                normal[0], normal[1], normal[2],
-                color[0], color[1], color[2], color[3],
-                lp[0], lp[1]
-              );
+              pushVertex(vertices, [wx, wy, wz], normal as Vec3, color, [lp[0], lp[1]]);
             }
 
-            // For non-planar top-face quads, choose the diagonal that minimises height difference
-            let quadIdx = QUAD_INDICES;
-            if (face === 4) {
-              const h0 = faceOffsets[0], h1 = faceOffsets[1];
-              const h2 = faceOffsets[2], h3 = faceOffsets[3];
-              // Compare diagonal 0-3 vs diagonal 1-2; use the one with smaller height diff
-              if (Math.abs(h0 - h3) < Math.abs(h1 - h2)) {
-                quadIdx = [0, 1, 3, 0, 3, 2]; // split along 0-3 diagonal
-              }
-            }
-            for (let ii = 0; ii < 6; ii++) indices.push(vertexCount + quadIdx[ii]);
+            for (let ii = 0; ii < 6; ii++) indices.push(vertexCount + QUAD_INDICES[ii]);
             vertexCount += 4;
           }
         }
       }
     }
   }
+  vertexCount = appendTerrainSurfaceMesh(data, sx, sy, sz, vertices, indices, vertexCount);
   return { vertices: new Float32Array(vertices), indices: new Uint32Array(indices), vertexCount, indexCount: indices.length };
 }
 
@@ -286,15 +474,181 @@ export class VoxelMeshRenderer {
   pipeline: GPURenderPipeline | null = null;
   vertexBuffer: GPUBuffer | null = null;
   indexBuffer: GPUBuffer | null = null;
+  previewVertexBuffer: GPUBuffer | null = null;
+  previewIndexBuffer: GPUBuffer | null = null;
   cameraBuffer: GPUBuffer | null = null;
   uniformBindGroup: GPUBindGroup | null = null;
   depthTexture: GPUTexture | null = null;
   depthTextureView: GPUTextureView | null = null;
+  voxelData: Uint8Array | null = null;
+  previewBlocks: GridPos[] = [];
+  previewColor: Vec4 = PREVIEW_BUILD_COLOR;
   indexCount = 0;
+  previewIndexCount = 0;
   width = 0;
   height = 0;
   initialized = false;
   sunDirection: [number, number, number] = [0.3, -0.8, 0.5];
+
+  voxelIndex(x: number, y: number, z: number) {
+    return x * VOXEL_GRID_Y * VOXEL_GRID_Z + y * VOXEL_GRID_Z + z;
+  }
+
+  inBounds(x: number, y: number, z: number) {
+    return x >= 0 && x < VOXEL_GRID_X && y >= 0 && y < VOXEL_GRID_Y && z >= 0 && z < VOXEL_GRID_Z;
+  }
+
+  getVoxel(x: number, y: number, z: number) {
+    if (!this.voxelData || !this.inBounds(x, y, z)) return 0;
+    return this.voxelData[this.voxelIndex(x, y, z)];
+  }
+
+  setVoxel(x: number, y: number, z: number, type: number) {
+    if (!this.voxelData || !this.inBounds(x, y, z)) return false;
+    this.voxelData[this.voxelIndex(x, y, z)] = type;
+    return true;
+  }
+
+  isSolidAtWorld(x: number, y: number, z: number) {
+    const vx = Math.floor(x / VOXEL_SCALE);
+    const vy = Math.floor(y / VOXEL_SCALE);
+    const vz = Math.floor(z / VOXEL_SCALE);
+    return isSolidVoxel(this.getVoxel(vx, vy, vz));
+  }
+
+  rebuildMesh() {
+    if (!this.device || !this.voxelData) return;
+    const mesh = generateVisibleBlockFaces(this.voxelData, VOXEL_GRID_X, VOXEL_GRID_Y, VOXEL_GRID_Z);
+    const vertexArray = mesh.vertices;
+    const indexArray = mesh.indices;
+    this.indexCount = indexArray.length;
+    this.vertexBuffer = this.device.createBuffer({ label: "Vertex Buffer", size: vertexArray.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(this.vertexBuffer, 0, vertexArray);
+    this.indexBuffer = this.device.createBuffer({ label: "Index Buffer", size: indexArray.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(this.indexBuffer, 0, indexArray);
+    this.rebuildPreviewMesh();
+  }
+
+  rebuildPreviewMesh() {
+    if (!this.device) return;
+    const vertices: number[] = [];
+    const indices: number[] = [];
+    let vertexCount = 0;
+    for (const [x, y, z] of this.previewBlocks) {
+      if (!this.inBounds(x, y, z)) continue;
+      vertexCount = appendBlockMesh(vertices, indices, vertexCount, x, y, z, this.previewColor, 0.035);
+    }
+    this.previewIndexCount = indices.length;
+    if (indices.length === 0) {
+      this.previewVertexBuffer = null;
+      this.previewIndexBuffer = null;
+      return;
+    }
+    const vertexArray = new Float32Array(vertices);
+    const indexArray = new Uint32Array(indices);
+    this.previewVertexBuffer = this.device.createBuffer({ label: "Preview Vertex Buffer", size: vertexArray.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(this.previewVertexBuffer, 0, vertexArray);
+    this.previewIndexBuffer = this.device.createBuffer({ label: "Preview Index Buffer", size: indexArray.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(this.previewIndexBuffer, 0, indexArray);
+  }
+
+  raycast(maxDistance = 8.0) {
+    const dir: Vec3 = [
+      Math.cos(camera.yaw) * Math.cos(camera.pitch),
+      Math.sin(camera.pitch),
+      Math.sin(camera.yaw) * Math.cos(camera.pitch),
+    ];
+    const step = VOXEL_SCALE * 0.35;
+    let lastAir: GridPos = [
+      Math.floor(camera.position[0] / VOXEL_SCALE),
+      Math.floor(camera.position[1] / VOXEL_SCALE),
+      Math.floor(camera.position[2] / VOXEL_SCALE),
+    ];
+    for (let d = 0; d <= maxDistance; d += step) {
+      const wx = camera.position[0] + dir[0] * d;
+      const wy = camera.position[1] + dir[1] * d;
+      const wz = camera.position[2] + dir[2] * d;
+      const pos: GridPos = [Math.floor(wx / VOXEL_SCALE), Math.floor(wy / VOXEL_SCALE), Math.floor(wz / VOXEL_SCALE)];
+      if (!this.inBounds(pos[0], pos[1], pos[2])) continue;
+      if (isSolidVoxel(this.getVoxel(pos[0], pos[1], pos[2]))) {
+        return { hit: pos, place: lastAir };
+      }
+      lastAir = pos;
+    }
+    return null;
+  }
+
+  wallBlocks(anchor: GridPos, cursor: GridPos) {
+    const minX = Math.min(anchor[0], cursor[0]);
+    const maxX = Math.max(anchor[0], cursor[0]);
+    const minZ = Math.min(anchor[2], cursor[2]);
+    const maxZ = Math.max(anchor[2], cursor[2]);
+    const y = Math.min(anchor[1], cursor[1]);
+    const blocks: GridPos[] = [];
+    for (let x = minX; x <= maxX; x++) {
+      for (let z = minZ; z <= maxZ; z++) {
+        if (x !== minX && x !== maxX && z !== minZ && z !== maxZ) continue;
+        for (let h = 0; h < wallHeight; h++) blocks.push([x, y + h, z]);
+      }
+    }
+    return blocks.slice(0, 2048);
+  }
+
+  updatePreview() {
+    const hit = this.raycast();
+    const blocks: GridPos[] = [];
+    this.previewColor = toolMode === "erase" ? PREVIEW_ERASE_COLOR : PREVIEW_BUILD_COLOR;
+
+    if (hit) {
+      if (toolMode === "erase") {
+        blocks.push(hit.hit);
+      } else if (toolMode === "wall") {
+        const anchor = wallAnchor || hit.place;
+        blocks.push(...this.wallBlocks(anchor, hit.place));
+      } else {
+        blocks.push(hit.place);
+      }
+    }
+
+    const same = blocks.length === this.previewBlocks.length && blocks.every((b, i) => {
+      const p = this.previewBlocks[i];
+      return p && p[0] === b[0] && p[1] === b[1] && p[2] === b[2];
+    });
+    if (!same) {
+      this.previewBlocks = blocks;
+      this.rebuildPreviewMesh();
+    }
+  }
+
+  applyTool() {
+    const hit = this.raycast();
+    if (!hit || !this.voxelData) return;
+    if (toolMode === "erase") {
+      this.setVoxel(hit.hit[0], hit.hit[1], hit.hit[2], 0);
+      this.previewBlocks = [];
+      this.rebuildMesh();
+      return;
+    }
+    if (toolMode === "wall") {
+      if (!wallAnchor) {
+        wallAnchor = hit.place;
+        this.updatePreview();
+        return;
+      }
+      for (const [x, y, z] of this.wallBlocks(wallAnchor, hit.place)) {
+        if (!isSolidVoxel(this.getVoxel(x, y, z))) this.setVoxel(x, y, z, BUILD_BLOCK_TYPE);
+      }
+      wallAnchor = null;
+      this.previewBlocks = [];
+      this.rebuildMesh();
+      return;
+    }
+    if (!isSolidVoxel(this.getVoxel(hit.place[0], hit.place[1], hit.place[2]))) {
+      this.setVoxel(hit.place[0], hit.place[1], hit.place[2], BUILD_BLOCK_TYPE);
+      this.previewBlocks = [];
+      this.rebuildMesh();
+    }
+  }
 
   async init(canvas: HTMLCanvasElement): Promise<boolean> {
     console.error("=== INIT START ===");
@@ -312,21 +666,10 @@ export class VoxelMeshRenderer {
     console.error("Context configured, format:", canvasFormat);
 
     console.time("generateVoxelWorld");
-    const voxelData = generateVoxelWorld(VOXEL_GRID_X, VOXEL_GRID_Y, VOXEL_GRID_Z);
+    this.voxelData = generateVoxelWorld(VOXEL_GRID_X, VOXEL_GRID_Y, VOXEL_GRID_Z);
     console.timeEnd("generateVoxelWorld");
-    console.time("generateVisibleBlockFaces");
-    const mesh = generateVisibleBlockFaces(voxelData, VOXEL_GRID_X, VOXEL_GRID_Y, VOXEL_GRID_Z);
-    console.timeEnd("generateVisibleBlockFaces");
-    console.error(`Generated ${mesh.vertexCount} vertices, ${mesh.indexCount} indices, ${mesh.indexCount / 6} quads`);
-    this.indexCount = mesh.indexCount;
 
     const vertexStride = 12 * 4;
-    this.vertexBuffer = this.device.createBuffer({ label: "Vertex Buffer", size: mesh.vertices.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    this.device.queue.writeBuffer(this.vertexBuffer, 0, mesh.vertices);
-    console.error("Vertex buffer created:", mesh.vertices.byteLength, "bytes");
-    this.indexBuffer = this.device.createBuffer({ label: "Index Buffer", size: mesh.indices.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
-    this.device.queue.writeBuffer(this.indexBuffer, 0, mesh.indices);
-    console.error("Index buffer created:", mesh.indices.byteLength, "bytes");
 
     this.cameraBuffer = this.device.createBuffer({ label: "Camera Uniforms", size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
@@ -353,7 +696,9 @@ export class VoxelMeshRenderer {
       depthStencil: { depthWriteEnabled: true, depthCompare: "less", format: "depth24plus" },
     });
     console.error("Pipeline created");
+    this.rebuildMesh();
     this.initialized = true;
+    activeRenderer = this;
     console.error("=== INIT COMPLETE ===");
     return true;
   }
@@ -411,7 +756,6 @@ export class VoxelMeshRenderer {
     try {
       this.updateCameraBuffer();
       const canvasTexture = this.context.getCurrentTexture();
-      console.error("RENDERING FRAME", "canvas:", canvasTexture.width, "x", canvasTexture.height, "quads:", this.indexCount / 6);
       const commandEncoder = this.device.createCommandEncoder({ label: "Render Encoder" });
       const textureView = canvasTexture.createView();
       const renderPass = commandEncoder.beginRenderPass({
@@ -424,9 +768,13 @@ export class VoxelMeshRenderer {
       renderPass.setVertexBuffer(0, this.vertexBuffer);
       renderPass.setIndexBuffer(this.indexBuffer, "uint32");
       renderPass.drawIndexed(this.indexCount, 1, 0, 0, 0);
+      if (this.previewVertexBuffer && this.previewIndexBuffer && this.previewIndexCount > 0) {
+        renderPass.setVertexBuffer(0, this.previewVertexBuffer);
+        renderPass.setIndexBuffer(this.previewIndexBuffer, "uint32");
+        renderPass.drawIndexed(this.previewIndexCount, 1, 0, 0, 0);
+      }
       renderPass.end();
       this.device.queue.submit([commandEncoder.finish()]);
-      console.error("FRAME SUBMITTED OK");
     } catch (e) { console.error("RENDER EXCEPTION:", e); }
   }
 
@@ -434,27 +782,123 @@ export class VoxelMeshRenderer {
 }
 
 export function setupInput(canvas: HTMLCanvasElement) {
-  window.addEventListener("keydown", (e: KeyboardEvent) => { keys[e.code] = true; if (e.code === "Escape") { mouseLocked = false; document.exitPointerLock(); } });
+  window.addEventListener("keydown", (e: KeyboardEvent) => {
+    keys[e.code] = true;
+    if (e.code === "Escape") { mouseLocked = false; document.exitPointerLock(); wallAnchor = null; }
+    if (e.code === "Digit1") { toolMode = "build"; wallAnchor = null; activeRenderer?.updatePreview(); }
+    if (e.code === "Digit2") { toolMode = "erase"; wallAnchor = null; activeRenderer?.updatePreview(); }
+    if (e.code === "Digit3") { toolMode = "wall"; wallAnchor = null; activeRenderer?.updatePreview(); }
+    if (e.code === "BracketLeft") { wallHeight = Math.max(1, wallHeight - 1); activeRenderer?.updatePreview(); }
+    if (e.code === "BracketRight") { wallHeight = Math.min(32, wallHeight + 1); activeRenderer?.updatePreview(); }
+    if (e.code === "KeyF") walkMode = !walkMode;
+  });
   window.addEventListener("keyup", (e: KeyboardEvent) => { keys[e.code] = false; });
-  canvas.addEventListener("click", () => { if (!mouseLocked) canvas.requestPointerLock(); });
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+  canvas.addEventListener("mousedown", (e) => {
+    if (!mouseLocked) {
+      canvas.requestPointerLock();
+      return;
+    }
+    if (e.button === 0) activeRenderer?.applyTool();
+  });
   document.addEventListener("pointerlockchange", () => { mouseLocked = document.pointerLockElement === canvas; });
-  document.addEventListener("mousemove", (e: MouseEvent) => { if (!mouseLocked) return; camera.yaw += e.movementX * 0.002; camera.pitch -= e.movementY * 0.002; camera.pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, camera.pitch)); });
+  document.addEventListener("mousemove", (e: MouseEvent) => {
+    if (!mouseLocked) return;
+    camera.yaw += e.movementX * 0.002;
+    camera.pitch -= e.movementY * 0.002;
+    camera.pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, camera.pitch));
+    activeRenderer?.updatePreview();
+  });
 }
 
-export function updateCamera(deltaTime: number) {
-  const speed = 8.0 * deltaTime;
+function playerCollides(renderer: VoxelMeshRenderer, pos: Vec3) {
+  const minX = pos[0] - PLAYER_RADIUS;
+  const maxX = pos[0] + PLAYER_RADIUS;
+  const minY = pos[1] - PLAYER_EYE;
+  const maxY = minY + PLAYER_HEIGHT;
+  const minZ = pos[2] - PLAYER_RADIUS;
+  const maxZ = pos[2] + PLAYER_RADIUS;
+  for (let x = Math.floor(minX / VOXEL_SCALE); x <= Math.floor(maxX / VOXEL_SCALE); x++) {
+    for (let y = Math.floor(minY / VOXEL_SCALE); y <= Math.floor(maxY / VOXEL_SCALE); y++) {
+      for (let z = Math.floor(minZ / VOXEL_SCALE); z <= Math.floor(maxZ / VOXEL_SCALE); z++) {
+        if (isSolidVoxel(renderer.getVoxel(x, y, z))) return true;
+      }
+    }
+  }
+  return false;
+}
+
+export function updateCamera(deltaTime: number, renderer: VoxelMeshRenderer | null = activeRenderer) {
+  const speed = (walkMode ? 4.0 : 8.0) * deltaTime;
   const forward: [number, number, number] = [Math.cos(camera.yaw) * Math.cos(camera.pitch), Math.sin(camera.pitch), Math.sin(camera.yaw) * Math.cos(camera.pitch)];
+  const flatForward: [number, number, number] = [Math.cos(camera.yaw), 0, Math.sin(camera.yaw)];
   const right: [number, number, number] = [Math.cos(camera.yaw + Math.PI / 2), 0, Math.sin(camera.yaw + Math.PI / 2)];
-  if (keys["KeyW"] || keys["ArrowUp"]) { camera.position[0] += forward[0] * speed; camera.position[1] += forward[1] * speed; camera.position[2] += forward[2] * speed; }
-  if (keys["KeyS"] || keys["ArrowDown"]) { camera.position[0] -= forward[0] * speed; camera.position[1] -= forward[1] * speed; camera.position[2] -= forward[2] * speed; }
-  if (keys["KeyA"] || keys["ArrowLeft"]) { camera.position[0] -= right[0] * speed; camera.position[2] -= right[2] * speed; }
-  if (keys["KeyD"] || keys["ArrowRight"]) { camera.position[0] += right[0] * speed; camera.position[2] += right[2] * speed; }
-  if (keys["Space"]) camera.position[1] += speed;
-  if (keys["ShiftLeft"] || keys["ControlLeft"]) camera.position[1] -= speed;
+  const oldPos: Vec3 = [...camera.position] as Vec3;
+  const next: Vec3 = [...camera.position] as Vec3;
+  const moveForward = walkMode ? flatForward : forward;
+  if (keys["KeyW"] || keys["ArrowUp"]) { next[0] += moveForward[0] * speed; next[1] += moveForward[1] * speed; next[2] += moveForward[2] * speed; }
+  if (keys["KeyS"] || keys["ArrowDown"]) { next[0] -= moveForward[0] * speed; next[1] -= moveForward[1] * speed; next[2] -= moveForward[2] * speed; }
+  if (keys["KeyA"] || keys["ArrowLeft"]) { next[0] -= right[0] * speed; next[2] -= right[2] * speed; }
+  if (keys["KeyD"] || keys["ArrowRight"]) { next[0] += right[0] * speed; next[2] += right[2] * speed; }
+
+  if (walkMode && renderer) {
+    const tryHorizontalMove = (axis: 0 | 2, value: number) => {
+      const test: Vec3 = [...camera.position] as Vec3;
+      test[axis] = value;
+      if (!playerCollides(renderer, test)) {
+        camera.position[axis] = value;
+        return;
+      }
+      if (!playerGrounded && playerVelocityY < -0.01) return;
+
+      const stepCount = 6;
+      for (let i = 1; i <= stepCount; i++) {
+        const lifted: Vec3 = [...camera.position] as Vec3;
+        lifted[axis] = value;
+        lifted[1] += (AUTO_STEP_HEIGHT * i) / stepCount;
+        if (!playerCollides(renderer, lifted)) {
+          camera.position[1] = lifted[1];
+          camera.position[axis] = value;
+          playerGrounded = false;
+          playerVelocityY = Math.max(playerVelocityY, 0);
+          return;
+        }
+      }
+    };
+    const tryMove = (axis: 0 | 1 | 2, value: number) => {
+      const test: Vec3 = [...camera.position] as Vec3;
+      test[axis] = value;
+      if (!playerCollides(renderer, test)) camera.position[axis] = value;
+      else if (axis === 1 && playerVelocityY < 0) playerGrounded = true;
+    };
+    tryHorizontalMove(0, next[0]);
+    tryHorizontalMove(2, next[2]);
+    if ((keys["Space"] || keys["KeyQ"]) && playerGrounded && !justJumped) {
+      playerVelocityY = 5.2;
+      playerGrounded = false;
+      justJumped = true;
+    }
+    if (!keys["Space"] && !keys["KeyQ"]) justJumped = false;
+    playerVelocityY -= 14.0 * deltaTime;
+    playerVelocityY = Math.max(playerVelocityY, -18.0);
+    const yNext = camera.position[1] + playerVelocityY * deltaTime;
+    playerGrounded = false;
+    tryMove(1, yNext);
+    if (playerGrounded) playerVelocityY = 0;
+  } else {
+    camera.position[0] = next[0]; camera.position[1] = next[1]; camera.position[2] = next[2];
+    if (keys["Space"]) camera.position[1] += speed;
+    if (keys["ShiftLeft"] || keys["ControlLeft"]) camera.position[1] -= speed;
+  }
   const worldSizeX = VOXEL_GRID_X * VOXEL_SCALE;
   const worldSizeY = VOXEL_GRID_Y * VOXEL_SCALE;
   const worldSizeZ = VOXEL_GRID_Z * VOXEL_SCALE;
   camera.position[0] = Math.max(0.1, Math.min(worldSizeX - 0.1, camera.position[0]));
   camera.position[1] = Math.max(0.1, Math.min(worldSizeY - 0.1, camera.position[1]));
   camera.position[2] = Math.max(0.1, Math.min(worldSizeZ - 0.1, camera.position[2]));
+  if (renderer && (oldPos[0] !== camera.position[0] || oldPos[1] !== camera.position[1] || oldPos[2] !== camera.position[2])) renderer.updatePreview();
+}
+
+export function getToolStatus() {
+  return `${walkMode ? "Walk" : "Fly"} | Tool: ${toolMode}${toolMode === "wall" ? ` | Wall H: ${wallHeight}${wallAnchor ? " | Anchor set" : ""}` : ""}`;
 }
