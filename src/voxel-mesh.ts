@@ -8,6 +8,10 @@ const VOXEL_GRID_X = 256;
 const VOXEL_GRID_Y = 128;
 const VOXEL_GRID_Z = 256;
 const VOXEL_SCALE = 0.125;
+const CHUNK_SIZE_X = 16;
+const CHUNK_SIZE_Z = 16;
+const CHUNK_COUNT_X = Math.ceil(VOXEL_GRID_X / CHUNK_SIZE_X);
+const CHUNK_COUNT_Z = Math.ceil(VOXEL_GRID_Z / CHUNK_SIZE_Z);
 
 export interface CameraState {
   position: [number, number, number];
@@ -72,6 +76,14 @@ const AUTO_STEP_HEIGHT = VOXEL_SCALE * 1.25;
 
 type ToolMode = "build" | "erase" | "wall";
 type GridPos = [number, number, number];
+type MeshBuild = { vertices: Float32Array; indices: Uint32Array; vertexCount: number; indexCount: number };
+type ChunkMesh = {
+  cx: number;
+  cz: number;
+  vertexBuffer: GPUBuffer | null;
+  indexBuffer: GPUBuffer | null;
+  indexCount: number;
+};
 
 type Vec3 = [number, number, number];
 type Vec4 = [number, number, number, number];
@@ -242,74 +254,59 @@ function generateVoxelWorld(sx: number, sy: number, sz: number): Uint8Array {
   return data;
 }
 
-function buildTerrainColumns(data: Uint8Array, sx: number, sy: number, sz: number) {
-  const topY = new Float32Array(sx * sz);
-  const blockY = new Int16Array(sx * sz);
-  const type = new Uint8Array(sx * sz);
-  const visible = new Uint8Array(sx * sz);
-
-  for (let x = 0; x < sx; x++) {
-    for (let z = 0; z < sz; z++) {
-      const ci = x * sz + z;
-      blockY[ci] = -1;
-      for (let y = sy - 2; y >= 1; y--) {
-        const idx = x * sy * sz + y * sz + z;
-        const voxelType = data[idx];
-        if (!isSmoothTerrain(voxelType)) continue;
-
-        type[ci] = voxelType;
-        blockY[ci] = y;
-        topY[ci] = y + 1;
-        const above = data[x * sy * sz + (y + 1) * sz + z];
-        visible[ci] = above === 0 || above === 4 ? 1 : 0;
-        break;
-      }
-    }
+function terrainColumn(data: Uint8Array, sx: number, sy: number, sz: number, x: number, z: number) {
+  if (x < 0 || x >= sx || z < 0 || z >= sz) return { topY: 0, blockY: -1, type: 0, visible: 0 };
+  for (let y = sy - 2; y >= 1; y--) {
+    const idx = x * sy * sz + y * sz + z;
+    const type = data[idx];
+    if (!isSmoothTerrain(type)) continue;
+    const above = data[x * sy * sz + (y + 1) * sz + z];
+    return { topY: y + 1, blockY: y, type, visible: above === 0 || above === 4 ? 1 : 0 };
   }
-
-  return { topY, blockY, type, visible };
+  return { topY: 0, blockY: -1, type: 0, visible: 0 };
 }
 
-function terrainColumnIndex(sx: number, sz: number, x: number, z: number) {
-  if (x < 0 || x >= sx || z < 0 || z >= sz) return -1;
-  return x * sz + z;
-}
-
-function terrainCornerY(columns: ReturnType<typeof buildTerrainColumns>, sx: number, sz: number, gx: number, gz: number, fallback: number) {
+function terrainCornerY(data: Uint8Array, sx: number, sy: number, sz: number, gx: number, gz: number, fallback: number) {
   const coords = [[gx - 1, gz - 1], [gx, gz - 1], [gx - 1, gz], [gx, gz]];
   let sum = 0;
   let count = 0;
   for (const [x, z] of coords) {
-    const ci = terrainColumnIndex(sx, sz, x, z);
-    if (ci < 0 || columns.visible[ci] === 0 || columns.topY[ci] <= 0) continue;
-    sum += columns.topY[ci];
+    const column = terrainColumn(data, sx, sy, sz, x, z);
+    if (column.visible === 0 || column.topY <= 0) continue;
+    sum += column.topY;
     count++;
   }
   return count > 0 ? sum / count : fallback;
 }
 
-function terrainCellHeights(columns: ReturnType<typeof buildTerrainColumns>, sx: number, sz: number, x: number, z: number) {
-  const ci = terrainColumnIndex(sx, sz, x, z);
-  const fallback = columns.topY[ci];
+function terrainCellHeights(data: Uint8Array, sx: number, sy: number, sz: number, x: number, z: number, fallback: number) {
   return [
-    terrainCornerY(columns, sx, sz, x, z, fallback),
-    terrainCornerY(columns, sx, sz, x + 1, z, fallback),
-    terrainCornerY(columns, sx, sz, x, z + 1, fallback),
-    terrainCornerY(columns, sx, sz, x + 1, z + 1, fallback),
+    terrainCornerY(data, sx, sy, sz, x, z, fallback),
+    terrainCornerY(data, sx, sy, sz, x + 1, z, fallback),
+    terrainCornerY(data, sx, sy, sz, x, z + 1, fallback),
+    terrainCornerY(data, sx, sy, sz, x + 1, z + 1, fallback),
   ];
 }
 
-function appendTerrainSurfaceMesh(data: Uint8Array, sx: number, sy: number, sz: number, vertices: number[], indices: number[], vertexCount: number) {
-  const columns = buildTerrainColumns(data, sx, sy, sz);
-  const minX = 1, maxX = sx - 2, minZ = 1, maxZ = sz - 2;
-
+function appendTerrainSurfaceMesh(
+  data: Uint8Array,
+  sx: number,
+  sy: number,
+  sz: number,
+  vertices: number[],
+  indices: number[],
+  vertexCount: number,
+  minX: number,
+  maxX: number,
+  minZ: number,
+  maxZ: number,
+) {
   for (let x = minX; x <= maxX; x++) {
     for (let z = minZ; z <= maxZ; z++) {
-      const ci = terrainColumnIndex(sx, sz, x, z);
-      if (columns.visible[ci] === 0 || columns.topY[ci] <= 0) continue;
-
-      const color = getVoxelColor(columns.type[ci]);
-      const h = terrainCellHeights(columns, sx, sz, x, z);
+      const column = terrainColumn(data, sx, sy, sz, x, z);
+      if (column.visible === 0 || column.topY <= 0) continue;
+      const color = getVoxelColor(column.type);
+      const h = terrainCellHeights(data, sx, sy, sz, x, z, column.topY);
 
       const topPoints: [Vec3, Vec3, Vec3, Vec3] = [
         [x, h[0], z],
@@ -317,7 +314,7 @@ function appendTerrainSurfaceMesh(data: Uint8Array, sx: number, sy: number, sz: 
         [x, h[2], z + 1],
         [x + 1, h[3], z + 1],
       ];
-      vertexCount = pushTerrainTop(vertices, indices, vertexCount, topPoints, columns.type[ci]);
+      vertexCount = pushTerrainTop(vertices, indices, vertexCount, topPoints, column.type);
 
       const edges = [
         { normal: [-1, 0, 0] as Vec3, top: [[x, h[0], z], [x, h[2], z + 1]] as [Vec3, Vec3] },
@@ -330,8 +327,8 @@ function appendTerrainSurfaceMesh(data: Uint8Array, sx: number, sy: number, sz: 
         vertexCount = pushQuad(vertices, indices, vertexCount, [
           edge.top[0],
           edge.top[1],
-          [edge.top[0][0], columns.blockY[ci], edge.top[0][2]],
-          [edge.top[1][0], columns.blockY[ci], edge.top[1][2]],
+          [edge.top[0][0], column.blockY, edge.top[0][2]],
+          [edge.top[1][0], column.blockY, edge.top[1][2]],
         ], edge.normal, color);
       }
     }
@@ -340,11 +337,21 @@ function appendTerrainSurfaceMesh(data: Uint8Array, sx: number, sy: number, sz: 
   return vertexCount;
 }
 
-function generateVisibleBlockFaces(data: Uint8Array, sx: number, sy: number, sz: number) {
+function generateVisibleBlockFaces(
+  data: Uint8Array,
+  sx: number,
+  sy: number,
+  sz: number,
+  bounds?: { minX: number; maxX: number; minZ: number; maxZ: number },
+): MeshBuild {
   const vertices: number[] = [];
   const indices: number[] = [];
   let vertexCount = 0;
-  const minX = 1, maxX = sx - 2, minY = 1, maxY = sy - 2, minZ = 1, maxZ = sz - 2;
+  const minX = Math.max(1, bounds?.minX ?? 1);
+  const maxX = Math.min(sx - 2, bounds?.maxX ?? sx - 2);
+  const minY = 1, maxY = sy - 2;
+  const minZ = Math.max(1, bounds?.minZ ?? 1);
+  const maxZ = Math.min(sz - 2, bounds?.maxZ ?? sz - 2);
 
   for (let x = minX; x <= maxX; x++) {
     for (let y = minY; y <= maxY; y++) {
@@ -388,7 +395,7 @@ function generateVisibleBlockFaces(data: Uint8Array, sx: number, sy: number, sz:
       }
     }
   }
-  vertexCount = appendTerrainSurfaceMesh(data, sx, sy, sz, vertices, indices, vertexCount);
+  vertexCount = appendTerrainSurfaceMesh(data, sx, sy, sz, vertices, indices, vertexCount, minX, maxX, minZ, maxZ);
   return { vertices: new Float32Array(vertices), indices: new Uint32Array(indices), vertexCount, indexCount: indices.length };
 }
 
@@ -472,8 +479,7 @@ export class VoxelMeshRenderer {
   device: GPUDevice | null = null;
   context: GPUCanvasContext | null = null;
   pipeline: GPURenderPipeline | null = null;
-  vertexBuffer: GPUBuffer | null = null;
-  indexBuffer: GPUBuffer | null = null;
+  chunks: ChunkMesh[] = [];
   previewVertexBuffer: GPUBuffer | null = null;
   previewIndexBuffer: GPUBuffer | null = null;
   cameraBuffer: GPUBuffer | null = null;
@@ -516,16 +522,95 @@ export class VoxelMeshRenderer {
     return isSolidVoxel(this.getVoxel(vx, vy, vz));
   }
 
-  rebuildMesh() {
+  chunkIndex(cx: number, cz: number) {
+    return cx * CHUNK_COUNT_Z + cz;
+  }
+
+  ensureChunks() {
+    if (this.chunks.length > 0) return;
+    for (let cx = 0; cx < CHUNK_COUNT_X; cx++) {
+      for (let cz = 0; cz < CHUNK_COUNT_Z; cz++) {
+        this.chunks[this.chunkIndex(cx, cz)] = { cx, cz, vertexBuffer: null, indexBuffer: null, indexCount: 0 };
+      }
+    }
+  }
+
+  rebuildChunk(cx: number, cz: number) {
+    if (!this.device || !this.voxelData || cx < 0 || cz < 0 || cx >= CHUNK_COUNT_X || cz >= CHUNK_COUNT_Z) return;
+    this.ensureChunks();
+    const minX = cx * CHUNK_SIZE_X;
+    const maxX = Math.min(VOXEL_GRID_X - 1, minX + CHUNK_SIZE_X - 1);
+    const minZ = cz * CHUNK_SIZE_Z;
+    const maxZ = Math.min(VOXEL_GRID_Z - 1, minZ + CHUNK_SIZE_Z - 1);
+    const mesh = generateVisibleBlockFaces(this.voxelData, VOXEL_GRID_X, VOXEL_GRID_Y, VOXEL_GRID_Z, { minX, maxX, minZ, maxZ });
+    const chunk = this.chunks[this.chunkIndex(cx, cz)];
+    chunk.indexCount = mesh.indices.length;
+    if (mesh.indices.length === 0) {
+      chunk.vertexBuffer = null;
+      chunk.indexBuffer = null;
+      return;
+    }
+    chunk.vertexBuffer = this.device.createBuffer({ label: `Chunk ${cx},${cz} Vertex Buffer`, size: mesh.vertices.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(chunk.vertexBuffer, 0, mesh.vertices);
+    chunk.indexBuffer = this.device.createBuffer({ label: `Chunk ${cx},${cz} Index Buffer`, size: mesh.indices.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(chunk.indexBuffer, 0, mesh.indices);
+  }
+
+  rebuildAllChunks() {
     if (!this.device || !this.voxelData) return;
-    const mesh = generateVisibleBlockFaces(this.voxelData, VOXEL_GRID_X, VOXEL_GRID_Y, VOXEL_GRID_Z);
-    const vertexArray = mesh.vertices;
-    const indexArray = mesh.indices;
-    this.indexCount = indexArray.length;
-    this.vertexBuffer = this.device.createBuffer({ label: "Vertex Buffer", size: vertexArray.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    this.device.queue.writeBuffer(this.vertexBuffer, 0, vertexArray);
-    this.indexBuffer = this.device.createBuffer({ label: "Index Buffer", size: indexArray.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
-    this.device.queue.writeBuffer(this.indexBuffer, 0, indexArray);
+    this.ensureChunks();
+    this.indexCount = 0;
+    for (let cx = 0; cx < CHUNK_COUNT_X; cx++) {
+      for (let cz = 0; cz < CHUNK_COUNT_Z; cz++) {
+        this.rebuildChunk(cx, cz);
+        this.indexCount += this.chunks[this.chunkIndex(cx, cz)].indexCount;
+      }
+    }
+    this.rebuildPreviewMesh();
+  }
+
+  rebuildChunksForVoxel(x: number, z: number) {
+    const cx = Math.floor(x / CHUNK_SIZE_X);
+    const cz = Math.floor(z / CHUNK_SIZE_Z);
+    const dirty = new Set<string>();
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dz = -1; dz <= 1; dz++) {
+        const ncx = cx + dx;
+        const ncz = cz + dz;
+        if (ncx < 0 || ncz < 0 || ncx >= CHUNK_COUNT_X || ncz >= CHUNK_COUNT_Z) continue;
+        dirty.add(`${ncx},${ncz}`);
+      }
+    }
+    for (const key of dirty) {
+      const [ncx, ncz] = key.split(",").map(Number);
+      const old = this.chunks[this.chunkIndex(ncx, ncz)]?.indexCount || 0;
+      this.rebuildChunk(ncx, ncz);
+      const current = this.chunks[this.chunkIndex(ncx, ncz)]?.indexCount || 0;
+      this.indexCount += current - old;
+    }
+    this.rebuildPreviewMesh();
+  }
+
+  rebuildChunkKeySet(chunkKeys: Set<string>) {
+    const expanded = new Set<string>();
+    for (const key of chunkKeys) {
+      const [cx, cz] = key.split(",").map(Number);
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          const ncx = cx + dx;
+          const ncz = cz + dz;
+          if (ncx < 0 || ncz < 0 || ncx >= CHUNK_COUNT_X || ncz >= CHUNK_COUNT_Z) continue;
+          expanded.add(`${ncx},${ncz}`);
+        }
+      }
+    }
+    for (const key of expanded) {
+      const [cx, cz] = key.split(",").map(Number);
+      const old = this.chunks[this.chunkIndex(cx, cz)]?.indexCount || 0;
+      this.rebuildChunk(cx, cz);
+      const current = this.chunks[this.chunkIndex(cx, cz)]?.indexCount || 0;
+      this.indexCount += current - old;
+    }
     this.rebuildPreviewMesh();
   }
 
@@ -626,7 +711,7 @@ export class VoxelMeshRenderer {
     if (toolMode === "erase") {
       this.setVoxel(hit.hit[0], hit.hit[1], hit.hit[2], 0);
       this.previewBlocks = [];
-      this.rebuildMesh();
+      this.rebuildChunksForVoxel(hit.hit[0], hit.hit[2]);
       return;
     }
     if (toolMode === "wall") {
@@ -638,15 +723,18 @@ export class VoxelMeshRenderer {
       for (const [x, y, z] of this.wallBlocks(wallAnchor, hit.place)) {
         if (!isSolidVoxel(this.getVoxel(x, y, z))) this.setVoxel(x, y, z, BUILD_BLOCK_TYPE);
       }
+      const changed = this.wallBlocks(wallAnchor, hit.place);
       wallAnchor = null;
       this.previewBlocks = [];
-      this.rebuildMesh();
+      const dirty = new Set<string>();
+      for (const [x, , z] of changed) dirty.add(`${Math.floor(x / CHUNK_SIZE_X)},${Math.floor(z / CHUNK_SIZE_Z)}`);
+      this.rebuildChunkKeySet(dirty);
       return;
     }
     if (!isSolidVoxel(this.getVoxel(hit.place[0], hit.place[1], hit.place[2]))) {
       this.setVoxel(hit.place[0], hit.place[1], hit.place[2], BUILD_BLOCK_TYPE);
       this.previewBlocks = [];
-      this.rebuildMesh();
+      this.rebuildChunksForVoxel(hit.place[0], hit.place[2]);
     }
   }
 
@@ -696,7 +784,7 @@ export class VoxelMeshRenderer {
       depthStencil: { depthWriteEnabled: true, depthCompare: "less", format: "depth24plus" },
     });
     console.error("Pipeline created");
-    this.rebuildMesh();
+    this.rebuildAllChunks();
     this.initialized = true;
     activeRenderer = this;
     console.error("=== INIT COMPLETE ===");
@@ -749,8 +837,8 @@ export class VoxelMeshRenderer {
   dot(a: [number, number, number], b: [number, number, number]): number { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 
   render() {
-    if (!this.initialized || !this.device || !this.context || !this.pipeline || !this.vertexBuffer || !this.indexBuffer || !this.uniformBindGroup || !this.depthTextureView) {
-      console.error("RENDER BLOCKED:", { initialized: this.initialized, device: !!this.device, context: !!this.context, pipeline: !!this.pipeline, vbuf: !!this.vertexBuffer, ibuf: !!this.indexBuffer, bindGroup: !!this.uniformBindGroup, depthView: !!this.depthTextureView });
+    if (!this.initialized || !this.device || !this.context || !this.pipeline || !this.uniformBindGroup || !this.depthTextureView) {
+      console.error("RENDER BLOCKED:", { initialized: this.initialized, device: !!this.device, context: !!this.context, pipeline: !!this.pipeline, bindGroup: !!this.uniformBindGroup, depthView: !!this.depthTextureView });
       return;
     }
     try {
@@ -765,9 +853,12 @@ export class VoxelMeshRenderer {
       });
       renderPass.setPipeline(this.pipeline);
       renderPass.setBindGroup(0, this.uniformBindGroup);
-      renderPass.setVertexBuffer(0, this.vertexBuffer);
-      renderPass.setIndexBuffer(this.indexBuffer, "uint32");
-      renderPass.drawIndexed(this.indexCount, 1, 0, 0, 0);
+      for (const chunk of this.chunks) {
+        if (!chunk?.vertexBuffer || !chunk.indexBuffer || chunk.indexCount === 0) continue;
+        renderPass.setVertexBuffer(0, chunk.vertexBuffer);
+        renderPass.setIndexBuffer(chunk.indexBuffer, "uint32");
+        renderPass.drawIndexed(chunk.indexCount, 1, 0, 0, 0);
+      }
       if (this.previewVertexBuffer && this.previewIndexBuffer && this.previewIndexCount > 0) {
         renderPass.setVertexBuffer(0, this.previewVertexBuffer);
         renderPass.setIndexBuffer(this.previewIndexBuffer, "uint32");
