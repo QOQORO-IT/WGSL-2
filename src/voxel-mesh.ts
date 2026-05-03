@@ -53,6 +53,26 @@ const NEIGHBOR_OFFSETS = [[-1,0,0],[0,-1,0],[0,0,-1],[1,0,0],[0,1,0],[0,0,1]];
 const QUAD_LOCAL = [[0,0,0],[1,0,0],[0,1,0],[1,1,0]];
 const QUAD_INDICES = [0,1,2,2,1,3];
 
+// For each top-face corner (vi 0-3), which 3 neighbours must ALL be empty for the corner to slope down?
+// Corner vi=0 → world offset (0,0): neighbours at (-1,0), (0,-1), (-1,-1) in XZ
+// Corner vi=1 → world offset (1,0): neighbours at (+1,0), (0,-1), (+1,-1)
+// Corner vi=2 → world offset (0,1): neighbours at (-1,0), (0,+1), (-1,+1)
+// Corner vi=3 → world offset (1,1): neighbours at (+1,0), (0,+1), (+1,+1)
+const TOP_CORNER_NEIGHBORS: [number, number][][] = [
+  [[-1,0],[0,-1],[-1,-1]],
+  [[ 1,0],[0,-1],[ 1,-1]],
+  [[-1,0],[0, 1],[-1, 1]],
+  [[ 1,0],[0, 1],[ 1, 1]],
+];
+
+// For each side face index, which top-face corner indices correspond to vi=2 and vi=3 (the top edge)?
+const SIDE_TOP_CORNERS: Record<number,[number,number]> = {
+  0: [0,2], // -X face
+  3: [1,3], // +X face
+  2: [0,1], // -Z face
+  5: [2,3], // +Z face
+};
+
 function generateVoxelWorld(sx: number, sy: number, sz: number): Uint8Array {
   const data = new Uint8Array(sx * sy * sz);
   for (let x = 0; x < sx; x++) {
@@ -82,6 +102,24 @@ function generateVoxelWorld(sx: number, sy: number, sz: number): Uint8Array {
   return data;
 }
 
+function computeCornerYOffsets(data: Uint8Array, sx: number, sy: number, sz: number, x: number, y: number, z: number): number[] {
+  // Only called when the top face (y+1) is exposed (air).
+  // For each of the 4 top-face corners, check the 3 XZ neighbours at the same Y level.
+  // If ALL three are air (solid block is one step lower), slope the corner down by 1.
+  const offsets = [0, 0, 0, 0];
+  for (let ci = 0; ci < 4; ci++) {
+    let allLower = true;
+    for (const [dx, dz] of TOP_CORNER_NEIGHBORS[ci]) {
+      const nx = x + dx, nz = z + dz;
+      if (nx < 0 || nx >= sx || nz < 0 || nz >= sz) { allLower = false; break; }
+      const nIdx = nx * sy * sz + y * sz + nz;
+      if (data[nIdx] !== 0) { allLower = false; break; }
+    }
+    if (allLower) offsets[ci] = -1;
+  }
+  return offsets;
+}
+
 function generateVisibleBlockFaces(data: Uint8Array, sx: number, sy: number, sz: number) {
   const vertices: number[] = [];
   const indices: number[] = [];
@@ -96,6 +134,12 @@ function generateVisibleBlockFaces(data: Uint8Array, sx: number, sy: number, sz:
         if (voxelType === 0) continue;
         const color = getVoxelColor(voxelType);
 
+        // Precompute top-face slope offsets once per block
+        const topExposed = data[x * sy * sz + (y + 1) * sz + z] === 0;
+        const cornerYOffsets = topExposed
+          ? computeCornerYOffsets(data, sx, sy, sz, x, y, z)
+          : [0, 0, 0, 0];
+
         for (let face = 0; face < 6; face++) {
           const [nx, ny, nz] = NEIGHBOR_OFFSETS[face];
           const nxIdx = (x + nx) * sy * sz + (y + ny) * sz + (z + nz);
@@ -107,6 +151,23 @@ function generateVisibleBlockFaces(data: Uint8Array, sx: number, sy: number, sz:
             const normal = FACE_NORMALS[face];
             const uAxis = FACE_U_AXES[face];
             const vAxis = FACE_V_AXES[face];
+
+            // Determine per-vertex Y offsets for slopes
+            const faceOffsets = [0, 0, 0, 0];
+            if (face === 4) {
+              // Top face: apply all 4 corner offsets
+              for (let i = 0; i < 4; i++) faceOffsets[i] = cornerYOffsets[i];
+            } else if (face in SIDE_TOP_CORNERS) {
+              // Side face: top verts (vi=2,3) inherit the matching top-face corners
+              const [c2, c3] = SIDE_TOP_CORNERS[face];
+              const off2 = cornerYOffsets[c2];
+              const off3 = cornerYOffsets[c3];
+              // If BOTH top corners collapsed to y, this side face has zero height – skip it
+              if (off2 === -1 && off3 === -1) continue;
+              faceOffsets[2] = off2;
+              faceOffsets[3] = off3;
+            }
+
             for (let vi = 0; vi < 4; vi++) {
               const lp = QUAD_LOCAL[vi];
               let wx = x, wy = y, wz = z;
@@ -114,6 +175,7 @@ function generateVisibleBlockFaces(data: Uint8Array, sx: number, sy: number, sz:
               wx += lp[0] * uAxis[0] + lp[1] * vAxis[0];
               wy += lp[0] * uAxis[1] + lp[1] * vAxis[1];
               wz += lp[0] * uAxis[2] + lp[1] * vAxis[2];
+              wy += faceOffsets[vi]; // apply slope
               vertices.push(
                 wx * VOXEL_SCALE, wy * VOXEL_SCALE, wz * VOXEL_SCALE,
                 normal[0], normal[1], normal[2],
@@ -121,7 +183,18 @@ function generateVisibleBlockFaces(data: Uint8Array, sx: number, sy: number, sz:
                 lp[0], lp[1]
               );
             }
-            for (let ii = 0; ii < 6; ii++) indices.push(vertexCount + QUAD_INDICES[ii]);
+
+            // For non-planar top-face quads, choose the diagonal that minimises height difference
+            let quadIdx = QUAD_INDICES;
+            if (face === 4) {
+              const h0 = faceOffsets[0], h1 = faceOffsets[1];
+              const h2 = faceOffsets[2], h3 = faceOffsets[3];
+              // Compare diagonal 0-3 vs diagonal 1-2; use the one with smaller height diff
+              if (Math.abs(h0 - h3) < Math.abs(h1 - h2)) {
+                quadIdx = [0, 1, 3, 0, 3, 2]; // split along 0-3 diagonal
+              }
+            }
+            for (let ii = 0; ii < 6; ii++) indices.push(vertexCount + quadIdx[ii]);
             vertexCount += 4;
           }
         }
